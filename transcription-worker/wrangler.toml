@@ -1,0 +1,7 @@
+name = "transcription-worker"
+main = "src/index.ts"
+compatibility_date = "2025-09-08"
+
+[ai]
+binding = "AI"
+
