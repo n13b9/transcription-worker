@@ -1,10 +1,10 @@
-// scripts/chunk-transcriber.ts
 import fetch from "node-fetch";
+import dotenv from "dotenv";
+dotenv.config();
+
 
 // Config
-const WORKER_URL =
-  process.env.WORKER_URL ||
-  "https://transcription-worker.h7384285.workers.dev";
+const WORKER_URL = process.env.WORKER_URL!;
 
 function getInputUrl(): string {
   const envUrl = process.env.MEDIA_URL;
@@ -134,10 +134,7 @@ async function run() {
     console.log("\n✅ FINAL TRANSCRIPTION (merged):\n");
     console.log(merged.text);
 
-    // Optionally save full transcript
-    // import fs from "fs";
-    // import path from "path";
-    // fs.writeFileSync(path.join(process.cwd(), "final_transcript.json"), JSON.stringify(merged, null, 2));
+   
   } catch (err) {
     console.error("❌ Error:", err);
     process.exitCode = 1;

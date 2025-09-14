@@ -23,6 +23,7 @@
 		"wrangler": "^4.34.0"
 	},
 	"dependencies": {
+		"dotenv": "^17.2.2",
 		"fetch": "^1.1.0",
 		"ffmpeg": "^0.0.4",
 		"fluent-ffmpeg": "^2.1.3",

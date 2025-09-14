@@ -2,13 +2,12 @@ export interface Env {
   AI: Ai;
 }
 
-const CHUNK_SIZE = 2 * 1024 * 1024; // 2MB
+const CHUNK_SIZE = 2 * 1024 * 1024;
 
-// Safe ArrayBuffer → base64
 function toBase64(buf: ArrayBuffer): string {
   let binary = "";
   const bytes = new Uint8Array(buf);
-  const step = 0x8000; // 32KB chunks to avoid stack overflow
+  const step = 0x8000;
   for (let i = 0; i < bytes.length; i += step) {
     const chunk = bytes.subarray(i, i + step);
     binary += String.fromCharCode.apply(null, Array.from(chunk));
@@ -35,7 +34,6 @@ export default {
       const end = offset + CHUNK_SIZE - 1;
       console.log(`Fetching bytes=${offset}-${end}`);
 
-      // Add fetch timeout (20s max wait)
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 20000);
 
@@ -54,17 +52,14 @@ export default {
       }
       clearTimeout(timeout);
 
-      // Detect expired signed URLs
       if (resp.status === 403 || resp.status === 401) {
         return json({ error: "URL expired or unauthorized" }, resp.status);
       }
 
-      // Detect server errors from origin
       if (resp.status >= 500) {
         return json({ error: `Origin error ${resp.status}` }, 502);
       }
 
-      // Must support Range
       if (resp.status !== 206 && resp.status !== 200) {
         return json(
           { error: `Origin does not support Range requests (status ${resp.status})` },
@@ -90,7 +85,7 @@ export default {
         offset,
         nextOffset,
         chunkSize: buffer.byteLength,
-        result: aiResp, // full Whisper response
+        result: aiResp,
       });
     } catch (err: any) {
       console.error("Worker error:", err);
@@ -99,7 +94,6 @@ export default {
   },
 };
 
-// Helper for JSON responses
 function json(obj: any, status = 200): Response {
   return new Response(JSON.stringify(obj, null, 2), {
     status,
