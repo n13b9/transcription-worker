@@ -1,5 +1,6 @@
 export interface Env {
   AI: Ai;
+  HARVEST_KEY: string;
 }
 
 const CHUNK_SIZE = 2 * 1024 * 1024;
@@ -15,16 +16,46 @@ function toBase64(buf: ArrayBuffer): string {
   return btoa(binary);
 }
 
+async function resolveUrl(inputUrl: string, env: Env): Promise<string> {
+  if (/\.(mp4|mp3|m4a|wav|flac|ogg|webm)$/i.test(inputUrl)) {
+    return inputUrl;
+  }
+
+  const resp = await fetch(
+    `https://harvester.satellite.ventures/getDownloadUrl?url=${encodeURIComponent(inputUrl)}`,
+    {
+      headers: {
+        Authorization: `Bearer ${env.HARVEST_KEY}`,
+      },
+    }
+  );
+
+  if (!resp.ok) {
+    throw new Error(`Failed to resolve URL (status ${resp.status})`);
+  }
+
+  const data: any = await resp.json();
+
+  const directUrl = data.downloadUrl;
+  if (!directUrl) {
+    throw new Error("Resolver did not return a valid downloadUrl");
+  }
+
+  return directUrl;
+}
+
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     try {
       const { searchParams } = new URL(req.url);
-      const url = searchParams.get("url");
+      const inputUrl = searchParams.get("url");
       const offsetParam = searchParams.get("offset");
 
-      if (!url) {
+      if (!inputUrl) {
         return json({ error: "Missing ?url" }, 400);
       }
+
+      const url = await resolveUrl(inputUrl, env);
 
       const offset = offsetParam ? parseInt(offsetParam, 10) : 0;
       if (isNaN(offset) || offset < 0) {
@@ -32,7 +63,6 @@ export default {
       }
 
       const end = offset + CHUNK_SIZE - 1;
-      console.log(`Fetching bytes=${offset}-${end}`);
 
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 20000);

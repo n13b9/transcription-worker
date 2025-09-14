@@ -4,3 +4,6 @@ compatibility_date = "2025-09-08"
 
 [ai]
 binding = "AI"
+
+[vars]
+HARVEST_KEY = "e0c35da0-7999-45f9-ae2d-738e2f2af223"
