@@ -3,7 +3,8 @@ export interface Env {
   HARVEST_KEY: string;
 }
 
-const CHUNK_SIZE = 2 * 1024 * 1024;
+const CHUNK_SIZE = 2 * 1024 * 1024; // 2MB
+const SMALL_FILE_LIMIT = 20 * 1024 * 1024; // 20MB
 
 function toBase64(buf: ArrayBuffer): string {
   let binary = "";
@@ -16,17 +17,18 @@ function toBase64(buf: ArrayBuffer): string {
   return btoa(binary);
 }
 
+// Resolve original social URL -> temporary download URL
 async function resolveUrl(inputUrl: string, env: Env): Promise<string> {
   if (/\.(mp4|mp3|m4a|wav|flac|ogg|webm)$/i.test(inputUrl)) {
     return inputUrl;
   }
 
   const resp = await fetch(
-    `https://harvester.satellite.ventures/getDownloadUrl?url=${encodeURIComponent(inputUrl)}`,
+    `https://harvester.satellite.ventures/getDownloadUrl?url=${encodeURIComponent(
+      inputUrl
+    )}`,
     {
-      headers: {
-        Authorization: `Bearer ${env.HARVEST_KEY}`,
-      },
+      headers: { Authorization: `Bearer ${env.HARVEST_KEY}` },
     }
   );
 
@@ -35,13 +37,81 @@ async function resolveUrl(inputUrl: string, env: Env): Promise<string> {
   }
 
   const data: any = await resp.json();
-
   const directUrl = data.downloadUrl;
   if (!directUrl) {
     throw new Error("Resolver did not return a valid downloadUrl");
   }
-
   return directUrl;
+}
+
+type Word = { word: string; start: number; end: number };
+type Segment = { start: number; end: number; text: string; words?: Word[] };
+
+function normalizeText(t: string) {
+  return t.toLowerCase().replace(/\s+/g, " ").replace(/[.,!?]/g, "").trim();
+}
+
+function mergeResults(chunks: Array<{ offset: number; result: any; chunkSize: number }>) {
+  let globalSegments: Segment[] = [];
+  let globalWords: Word[] = [];
+
+  for (const { offset, result, chunkSize } of chunks) {
+    const segs: Segment[] = result.segments || [];
+    const wrds: Word[] = result.words || [];
+
+    const chunkDuration = result.transcription_info?.duration ?? 0;
+    const lastSegment =
+      globalSegments.length > 0 ? globalSegments[globalSegments.length - 1] : null;
+    const timeOffset =
+      (offset / chunkSize) * chunkDuration || (lastSegment ? lastSegment.end : 0);
+
+    for (const s of segs) {
+      globalSegments.push({
+        start: s.start + timeOffset,
+        end: s.end + timeOffset,
+        text: s.text,
+        words: s.words?.map((w: Word) => ({
+          word: w.word,
+          start: w.start + timeOffset,
+          end: w.end + timeOffset,
+        })),
+      });
+    }
+
+    for (const w of wrds) {
+      globalWords.push({
+        word: w.word,
+        start: w.start + timeOffset,
+        end: w.end + timeOffset,
+      });
+    }
+  }
+
+  globalSegments.sort((a, b) => a.start - b.start);
+  globalWords.sort((a, b) => a.start - b.start);
+
+  const dedupSegments: Segment[] = [];
+  for (const s of globalSegments) {
+    const prev = dedupSegments[dedupSegments.length - 1];
+    if (prev) {
+      const overlap = Math.max(0, Math.min(prev.end, s.end) - Math.max(prev.start, s.start));
+      const span = Math.max(prev.end - prev.start, s.end - s.start, 1e-3);
+      const similar = normalizeText(prev.text) === normalizeText(s.text);
+      if (overlap / span > 0.5 && similar) {
+        dedupSegments[dedupSegments.length - 1] = s;
+        continue;
+      }
+    }
+    dedupSegments.push(s);
+  }
+
+  const fullText = dedupSegments
+    .map((s) => s.text.trim())
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return { text: fullText, segments: dedupSegments, words: globalWords };
 }
 
 export default {
@@ -49,73 +119,113 @@ export default {
     try {
       const { searchParams } = new URL(req.url);
       const inputUrl = searchParams.get("url");
-      const offsetParam = searchParams.get("offset");
-
       if (!inputUrl) {
         return json({ error: "Missing ?url" }, 400);
       }
 
-      const url = await resolveUrl(inputUrl, env);
+      let url = await resolveUrl(inputUrl, env);
 
-      const offset = offsetParam ? parseInt(offsetParam, 10) : 0;
-      if (isNaN(offset) || offset < 0) {
-        return json({ error: "Invalid offset" }, 400);
+
+      const probeResp = await fetch(url, { headers: { Range: "bytes=0-0" } });
+      if (!probeResp.ok) {
+        throw new Error(`Probe request failed: ${probeResp.status}`);
       }
-
-      const end = offset + CHUNK_SIZE - 1;
-
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 20000);
-
-      let resp: Response;
-      try {
-        resp = await fetch(url, {
-          headers: { Range: `bytes=${offset}-${end}` },
-          signal: controller.signal,
-        });
-      } catch (e: any) {
-        clearTimeout(timeout);
-        if (e.name === "AbortError") {
-          return json({ error: "Origin too slow or unresponsive" }, 504);
+      const contentRange = probeResp.headers.get("Content-Range");
+      let fileSize = 0;
+      if (contentRange) {
+        const parts = contentRange.split("/");
+        if (parts.length === 2) {
+          fileSize = parseInt(parts[1], 10);
         }
-        return json({ error: `Failed to fetch origin: ${e.message}` }, 502);
-      }
-      clearTimeout(timeout);
-
-      if (resp.status === 403 || resp.status === 401) {
-        return json({ error: "URL expired or unauthorized" }, resp.status);
       }
 
-      if (resp.status >= 500) {
-        return json({ error: `Origin error ${resp.status}` }, 502);
+      const allChunks: { offset: number; result: any; chunkSize: number }[] = [];
+      let offset = 0;
+
+
+      if (fileSize > 0 && fileSize <= SMALL_FILE_LIMIT) {
+        console.log(`Small file (${fileSize} bytes), fetching whole file...`);
+        const fullResp = await fetch(url);
+        if (!fullResp.ok) throw new Error(`Failed to fetch full file (${fullResp.status})`);
+        const buffer = await fullResp.arrayBuffer();
+        const base64Audio = toBase64(buffer);
+        const aiResp = await env.AI.run("@cf/openai/whisper-large-v3-turbo", {
+          audio: base64Audio,
+        });
+        allChunks.push({ offset: 0, result: aiResp, chunkSize: buffer.byteLength });
+        offset = buffer.byteLength;
       }
 
-      if (resp.status !== 206 && resp.status !== 200) {
-        return json(
-          { error: `Origin does not support Range requests (status ${resp.status})` },
-          400
-        );
+      else if (fileSize === 0) {
+        console.log("File size unknown, fetching full file as fallback...");
+        const fullResp = await fetch(url);
+        if (!fullResp.ok) throw new Error(`Failed to fetch full file (${fullResp.status})`);
+        const buffer = await fullResp.arrayBuffer();
+        const base64Audio = toBase64(buffer);
+        const aiResp = await env.AI.run("@cf/openai/whisper-large-v3-turbo", {
+          audio: base64Audio,
+        });
+        allChunks.push({ offset: 0, result: aiResp, chunkSize: buffer.byteLength });
+        offset = buffer.byteLength;
+        fileSize = buffer.byteLength; // assign so meta works
       }
 
-      const buffer = await resp.arrayBuffer();
-      if (buffer.byteLength === 0) {
-        return json({ done: true, message: "No more bytes" });
+      else {
+        while (true) {
+          const end = offset + CHUNK_SIZE - 1;
+          console.log(`Fetching bytes=${offset}-${end}`);
+
+          let resp = await fetch(url, { headers: { Range: `bytes=${offset}-${end}` } });
+          if (resp.status === 403 || resp.status === 401) {
+            console.log("URL expired, refreshing...");
+            url = await resolveUrl(inputUrl, env);
+            resp = await fetch(url, { headers: { Range: `bytes=${offset}-${end}` } });
+          }
+
+          if (resp.status !== 206 && resp.status !== 200) {
+            if (offset === 0) {
+              throw new Error(`Origin not responsive (status ${resp.status})`);
+            }
+            break;
+          }
+
+          const buffer = await resp.arrayBuffer();
+          if (buffer.byteLength === 0) {
+            if (offset === 0) {
+              throw new Error("Origin not responsive or URL expired before any data was fetched");
+            }
+            break;
+          }
+
+          const base64Audio = toBase64(buffer);
+          const aiResp = await env.AI.run("@cf/openai/whisper-large-v3-turbo", {
+            audio: base64Audio,
+          });
+
+          allChunks.push({ offset, result: aiResp, chunkSize: buffer.byteLength });
+          offset += buffer.byteLength;
+        }
       }
 
-      const base64Audio = toBase64(buffer);
+      const merged = mergeResults(allChunks);
 
-      const aiResp = await env.AI.run("@cf/openai/whisper-large-v3-turbo", {
-        audio: base64Audio,
-      });
+      const lastSegment = merged.segments.length
+        ? merged.segments[merged.segments.length - 1]
+        : null;
+      const processedDuration = lastSegment ? lastSegment.end : 0;
 
-      const nextOffset = offset + buffer.byteLength;
+      const meta = {
+        processedDuration,
+        segmentCount: merged.segments.length,
+        bytesProcessed: offset,
+        fileSize: fileSize || null,
+        isComplete: fileSize ? offset >= fileSize : null,
+      };
 
       return json({
-        done: false,
-        offset,
-        nextOffset,
-        chunkSize: buffer.byteLength,
-        result: aiResp,
+        text: merged.text,
+        segments: merged.segments,
+        meta,
       });
     } catch (err: any) {
       console.error("Worker error:", err);
