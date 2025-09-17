@@ -3,8 +3,9 @@ export interface Env {
   HARVEST_KEY: string;
 }
 
-const CHUNK_SIZE = 2 * 1024 * 1024; // 2MB
-const SMALL_FILE_LIMIT = 20 * 1024 * 1024; // 20MB
+const CHUNK_SIZE = 8 * 1024 * 1024; // 8MB safe ceiling for Workers AI
+const SMALL_FILE_LIMIT = 20 * 1024 * 1024; // 20MB for single-shot
+const MAX_PARALLEL = 5; // increased concurrency
 
 function toBase64(buf: ArrayBuffer): string {
   let binary = "";
@@ -17,31 +18,18 @@ function toBase64(buf: ArrayBuffer): string {
   return btoa(binary);
 }
 
-// Resolve original social URL -> temporary download URL
 async function resolveUrl(inputUrl: string, env: Env): Promise<string> {
-  if (/\.(mp4|mp3|m4a|wav|flac|ogg|webm)$/i.test(inputUrl)) {
-    return inputUrl;
-  }
+  if (/\.(mp4|mp3|m4a|wav|flac|ogg|webm)$/i.test(inputUrl)) return inputUrl;
 
   const resp = await fetch(
-    `https://harvester.satellite.ventures/getDownloadUrl?url=${encodeURIComponent(
-      inputUrl
-    )}`,
-    {
-      headers: { Authorization: `Bearer ${env.HARVEST_KEY}` },
-    }
+    `https://harvester.satellite.ventures/getDownloadUrl?url=${encodeURIComponent(inputUrl)}`,
+    { headers: { Authorization: `Bearer ${env.HARVEST_KEY}` } }
   );
-
-  if (!resp.ok) {
-    throw new Error(`Failed to resolve URL (status ${resp.status})`);
-  }
+  if (!resp.ok) throw new Error(`Failed to resolve URL (status ${resp.status})`);
 
   const data: any = await resp.json();
-  const directUrl = data.downloadUrl;
-  if (!directUrl) {
-    throw new Error("Resolver did not return a valid downloadUrl");
-  }
-  return directUrl;
+  if (!data.downloadUrl) throw new Error("Resolver did not return a valid downloadUrl");
+  return data.downloadUrl;
 }
 
 type Word = { word: string; start: number; end: number };
@@ -58,12 +46,9 @@ function mergeResults(chunks: Array<{ offset: number; result: any; chunkSize: nu
   for (const { offset, result, chunkSize } of chunks) {
     const segs: Segment[] = result.segments || [];
     const wrds: Word[] = result.words || [];
-
     const chunkDuration = result.transcription_info?.duration ?? 0;
-    const lastSegment =
-      globalSegments.length > 0 ? globalSegments[globalSegments.length - 1] : null;
-    const timeOffset =
-      (offset / chunkSize) * chunkDuration || (lastSegment ? lastSegment.end : 0);
+    const lastSegment = globalSegments.length > 0 ? globalSegments[globalSegments.length - 1] : null;
+    const timeOffset = (offset / chunkSize) * chunkDuration || (lastSegment ? lastSegment.end : 0);
 
     for (const s of segs) {
       globalSegments.push({
@@ -105,13 +90,28 @@ function mergeResults(chunks: Array<{ offset: number; result: any; chunkSize: nu
     dedupSegments.push(s);
   }
 
-  const fullText = dedupSegments
-    .map((s) => s.text.trim())
-    .join(" ")
-    .replace(/\s+/g, " ")
-    .trim();
-
+  const fullText = dedupSegments.map((s) => s.text.trim()).join(" ").replace(/\s+/g, " ").trim();
   return { text: fullText, segments: dedupSegments, words: globalWords };
+}
+
+async function processChunk(
+  env: Env,
+  url: string,
+  inputUrl: string,
+  offset: number,
+  end: number
+): Promise<{ offset: number; result: any; chunkSize: number }> {
+  let resp = await fetch(url, { headers: { Range: `bytes=${offset}-${end}` } });
+  if (resp.status === 403 || resp.status === 401) {
+    url = await resolveUrl(inputUrl, env);
+    resp = await fetch(url, { headers: { Range: `bytes=${offset}-${end}` } });
+  }
+  if (resp.status !== 206 && resp.status !== 200) throw new Error(`Origin fetch failed: ${resp.status}`);
+  const buffer = await resp.arrayBuffer();
+  if (buffer.byteLength === 0) throw new Error("Empty chunk received");
+  const base64Audio = toBase64(buffer);
+  const aiResp = await env.AI.run("@cf/openai/whisper-large-v3-turbo", { audio: base64Audio });
+  return { offset, result: aiResp, chunkSize: buffer.byteLength };
 }
 
 export default {
@@ -119,99 +119,45 @@ export default {
     try {
       const { searchParams } = new URL(req.url);
       const inputUrl = searchParams.get("url");
-      if (!inputUrl) {
-        return json({ error: "Missing ?url" }, 400);
-      }
+      if (!inputUrl) return json({ error: "Missing ?url" }, 400);
 
       let url = await resolveUrl(inputUrl, env);
 
-
       const probeResp = await fetch(url, { headers: { Range: "bytes=0-0" } });
-      if (!probeResp.ok) {
-        throw new Error(`Probe request failed: ${probeResp.status}`);
-      }
+      if (!probeResp.ok) throw new Error(`Probe failed: ${probeResp.status}`);
       const contentRange = probeResp.headers.get("Content-Range");
       let fileSize = 0;
       if (contentRange) {
         const parts = contentRange.split("/");
-        if (parts.length === 2) {
-          fileSize = parseInt(parts[1], 10);
-        }
+        if (parts.length === 2) fileSize = parseInt(parts[1], 10);
       }
 
       const allChunks: { offset: number; result: any; chunkSize: number }[] = [];
       let offset = 0;
 
-
       if (fileSize > 0 && fileSize <= SMALL_FILE_LIMIT) {
-        console.log(`Small file (${fileSize} bytes), fetching whole file...`);
         const fullResp = await fetch(url);
-        if (!fullResp.ok) throw new Error(`Failed to fetch full file (${fullResp.status})`);
         const buffer = await fullResp.arrayBuffer();
         const base64Audio = toBase64(buffer);
-        const aiResp = await env.AI.run("@cf/openai/whisper-large-v3-turbo", {
-          audio: base64Audio,
-        });
+        const aiResp = await env.AI.run("@cf/openai/whisper-large-v3-turbo", { audio: base64Audio });
         allChunks.push({ offset: 0, result: aiResp, chunkSize: buffer.byteLength });
         offset = buffer.byteLength;
-      }
-
-      else if (fileSize === 0) {
-        console.log("File size unknown, fetching full file as fallback...");
-        const fullResp = await fetch(url);
-        if (!fullResp.ok) throw new Error(`Failed to fetch full file (${fullResp.status})`);
-        const buffer = await fullResp.arrayBuffer();
-        const base64Audio = toBase64(buffer);
-        const aiResp = await env.AI.run("@cf/openai/whisper-large-v3-turbo", {
-          audio: base64Audio,
-        });
-        allChunks.push({ offset: 0, result: aiResp, chunkSize: buffer.byteLength });
-        offset = buffer.byteLength;
-        fileSize = buffer.byteLength; // assign so meta works
-      }
-
-      else {
-        while (true) {
-          const end = offset + CHUNK_SIZE - 1;
-          console.log(`Fetching bytes=${offset}-${end}`);
-
-          let resp = await fetch(url, { headers: { Range: `bytes=${offset}-${end}` } });
-          if (resp.status === 403 || resp.status === 401) {
-            console.log("URL expired, refreshing...");
-            url = await resolveUrl(inputUrl, env);
-            resp = await fetch(url, { headers: { Range: `bytes=${offset}-${end}` } });
+      } else {
+        while (offset < fileSize) {
+          const tasks = [];
+          for (let i = 0; i < MAX_PARALLEL && offset < fileSize; i++) {
+            const end = Math.min(offset + CHUNK_SIZE - 1, fileSize - 1);
+            tasks.push(processChunk(env, url, inputUrl, offset, end));
+            offset += CHUNK_SIZE;
           }
-
-          if (resp.status !== 206 && resp.status !== 200) {
-            if (offset === 0) {
-              throw new Error(`Origin not responsive (status ${resp.status})`);
-            }
-            break;
-          }
-
-          const buffer = await resp.arrayBuffer();
-          if (buffer.byteLength === 0) {
-            if (offset === 0) {
-              throw new Error("Origin not responsive or URL expired before any data was fetched");
-            }
-            break;
-          }
-
-          const base64Audio = toBase64(buffer);
-          const aiResp = await env.AI.run("@cf/openai/whisper-large-v3-turbo", {
-            audio: base64Audio,
-          });
-
-          allChunks.push({ offset, result: aiResp, chunkSize: buffer.byteLength });
-          offset += buffer.byteLength;
+          const results = await Promise.all(tasks);
+          allChunks.push(...results);
         }
       }
 
-      const merged = mergeResults(allChunks);
-
-      const lastSegment = merged.segments.length
-        ? merged.segments[merged.segments.length - 1]
-        : null;
+            const merged = mergeResults(allChunks);
+      const lastSegment =
+        merged.segments.length > 0 ? merged.segments[merged.segments.length - 1] : null;
       const processedDuration = lastSegment ? lastSegment.end : 0;
 
       const meta = {
@@ -222,11 +168,8 @@ export default {
         isComplete: fileSize ? offset >= fileSize : null,
       };
 
-      return json({
-        text: merged.text,
-        segments: merged.segments,
-        meta,
-      });
+
+      return json({ text: merged.text, segments: merged.segments, meta });
     } catch (err: any) {
       console.error("Worker error:", err);
       return json({ error: err.message || String(err) }, 500);
