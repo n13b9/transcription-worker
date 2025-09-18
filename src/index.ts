@@ -99,20 +99,52 @@ async function processChunk(
   url: string,
   inputUrl: string,
   offset: number,
-  end: number
+  end: number,
+  attempt = 1
 ): Promise<{ offset: number; result: any; chunkSize: number }> {
   let resp = await fetch(url, { headers: { Range: `bytes=${offset}-${end}` } });
+
+  // if signed URL expired, re-resolve
   if (resp.status === 403 || resp.status === 401) {
     url = await resolveUrl(inputUrl, env);
     resp = await fetch(url, { headers: { Range: `bytes=${offset}-${end}` } });
   }
-  if (resp.status !== 206 && resp.status !== 200) throw new Error(`Origin fetch failed: ${resp.status}`);
+
+  if (resp.status !== 206 && resp.status !== 200) {
+    throw new Error(`Origin fetch failed: ${resp.status}`);
+  }
+
   const buffer = await resp.arrayBuffer();
-  if (buffer.byteLength === 0) throw new Error("Empty chunk received");
+  if (buffer.byteLength === 0) {
+    // retry if possible
+    if (attempt < 3) {
+      console.warn(`Empty chunk at offset=${offset}, retrying...`);
+      return processChunk(env, url, inputUrl, offset, end, attempt + 1);
+    }
+    throw new Error(`Empty chunk received after ${attempt} attempts`);
+  }
+
+  // quick sanity check: avoid passing HTML or JSON into Whisper
+  const head = new TextDecoder().decode(buffer.slice(0, 64));
+  if (/<!DOCTYPE|<html|{"error/.test(head)) {
+    if (attempt < 3) {
+      console.warn(`Non-audio data detected at offset=${offset}, retrying...`);
+      return processChunk(env, url, inputUrl, offset, end, attempt + 1);
+    }
+    throw new Error(`Harvester returned non-audio data at offset=${offset}`);
+  }
+
+  // ✅ convert to base64 audio
   const base64Audio = toBase64(buffer);
-  const aiResp = await env.AI.run("@cf/openai/whisper-large-v3-turbo", { audio: base64Audio });
+
+  // run transcription
+  const aiResp = await env.AI.run("@cf/openai/whisper-large-v3-turbo", {
+    audio: base64Audio,
+  });
+
   return { offset, result: aiResp, chunkSize: buffer.byteLength };
 }
+
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
