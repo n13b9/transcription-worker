@@ -3,9 +3,16 @@ export interface Env {
   HARVEST_KEY: string;
 }
 
-const CHUNK_SIZE = 8 * 1024 * 1024; // 8MB safe ceiling for Workers AI
+const DEFAULT_CHUNK_SIZE = 8 * 1024 * 1024; // 8MB safe ceiling
 const SMALL_FILE_LIMIT = 20 * 1024 * 1024; // 20MB for single-shot
-const MAX_PARALLEL = 5; // increased concurrency
+const DEFAULT_PARALLEL = 10; // bumped from 5
+
+function json(obj: any, status = 200): Response {
+  return new Response(JSON.stringify(obj, null, 2), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
 
 function toBase64(buf: ArrayBuffer): string {
   let binary = "";
@@ -104,7 +111,6 @@ async function processChunk(
 ): Promise<{ offset: number; result: any; chunkSize: number }> {
   let resp = await fetch(url, { headers: { Range: `bytes=${offset}-${end}` } });
 
-  // if signed URL expired, re-resolve
   if (resp.status === 403 || resp.status === 401) {
     url = await resolveUrl(inputUrl, env);
     resp = await fetch(url, { headers: { Range: `bytes=${offset}-${end}` } });
@@ -116,7 +122,6 @@ async function processChunk(
 
   const buffer = await resp.arrayBuffer();
   if (buffer.byteLength === 0) {
-    // retry if possible
     if (attempt < 3) {
       console.warn(`Empty chunk at offset=${offset}, retrying...`);
       return processChunk(env, url, inputUrl, offset, end, attempt + 1);
@@ -124,7 +129,6 @@ async function processChunk(
     throw new Error(`Empty chunk received after ${attempt} attempts`);
   }
 
-  // quick sanity check: avoid passing HTML or JSON into Whisper
   const head = new TextDecoder().decode(buffer.slice(0, 64));
   if (/<!DOCTYPE|<html|{"error/.test(head)) {
     if (attempt < 3) {
@@ -134,17 +138,14 @@ async function processChunk(
     throw new Error(`Harvester returned non-audio data at offset=${offset}`);
   }
 
-  // ✅ convert to base64 audio
   const base64Audio = toBase64(buffer);
 
-  // run transcription
   const aiResp = await env.AI.run("@cf/openai/whisper-large-v3-turbo", {
     audio: base64Audio,
   });
 
   return { offset, result: aiResp, chunkSize: buffer.byteLength };
 }
-
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
@@ -153,8 +154,15 @@ export default {
       const inputUrl = searchParams.get("url");
       if (!inputUrl) return json({ error: "Missing ?url" }, 400);
 
+      const parallelOverride = parseInt(searchParams.get("parallel") || "");
+      const MAX_PARALLEL =
+        !isNaN(parallelOverride) && parallelOverride > 0
+          ? parallelOverride
+          : DEFAULT_PARALLEL;
+
       let url = await resolveUrl(inputUrl, env);
 
+      // Probe file size
       const probeResp = await fetch(url, { headers: { Range: "bytes=0-0" } });
       if (!probeResp.ok) throw new Error(`Probe failed: ${probeResp.status}`);
       const contentRange = probeResp.headers.get("Content-Range");
@@ -162,6 +170,12 @@ export default {
       if (contentRange) {
         const parts = contentRange.split("/");
         if (parts.length === 2) fileSize = parseInt(parts[1], 10);
+      }
+
+      // Dynamically adjust chunk size
+      let chunkSize = DEFAULT_CHUNK_SIZE;
+      if (fileSize > 40 * 1024 * 1024) {
+        chunkSize = 4 * 1024 * 1024; // use 4MB chunks for larger files
       }
 
       const allChunks: { offset: number; result: any; chunkSize: number }[] = [];
@@ -178,16 +192,16 @@ export default {
         while (offset < fileSize) {
           const tasks = [];
           for (let i = 0; i < MAX_PARALLEL && offset < fileSize; i++) {
-            const end = Math.min(offset + CHUNK_SIZE - 1, fileSize - 1);
+            const end = Math.min(offset + chunkSize - 1, fileSize - 1);
             tasks.push(processChunk(env, url, inputUrl, offset, end));
-            offset += CHUNK_SIZE;
+            offset += chunkSize;
           }
           const results = await Promise.all(tasks);
           allChunks.push(...results);
         }
       }
 
-            const merged = mergeResults(allChunks);
+      const merged = mergeResults(allChunks);
       const lastSegment =
         merged.segments.length > 0 ? merged.segments[merged.segments.length - 1] : null;
       const processedDuration = lastSegment ? lastSegment.end : 0;
@@ -198,8 +212,9 @@ export default {
         bytesProcessed: offset,
         fileSize: fileSize || null,
         isComplete: fileSize ? offset >= fileSize : null,
+        parallelism: MAX_PARALLEL,
+        chunkSize,
       };
-
 
       return json({ text: merged.text, segments: merged.segments, meta });
     } catch (err: any) {
@@ -208,10 +223,3 @@ export default {
     }
   },
 };
-
-function json(obj: any, status = 200): Response {
-  return new Response(JSON.stringify(obj, null, 2), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
-}
