@@ -3,9 +3,12 @@ export interface Env {
   HARVEST_KEY: string;
 }
 
-const DEFAULT_CHUNK_SIZE = 8 * 1024 * 1024; // 8MB safe ceiling
-const SMALL_FILE_LIMIT = 20 * 1024 * 1024; // 20MB for single-shot
-const DEFAULT_PARALLEL = 10; // bumped from 5
+const DEFAULT_CHUNK_SIZE = 8 * 1024 * 1024; // 8MB for <50MB files
+const SMALL_FILE_LIMIT = 20 * 1024 * 1024;  // single-shot
+const MEDIUM_FILE_LIMIT = 50 * 1024 * 1024; // <=50MB uses fast logic
+const SAFE_CHUNK_SIZE = 2 * 1024 * 1024;    // 2MB safe for >50MB
+const SAFE_PARALLEL = 3;                    // safe parallelism for >50MB
+const DEFAULT_PARALLEL = 10;                // fast parallelism for <50MB
 
 function json(obj: any, status = 200): Response {
   return new Response(JSON.stringify(obj, null, 2), {
@@ -36,6 +39,8 @@ async function resolveUrl(inputUrl: string, env: Env): Promise<string> {
 
   const data: any = await resp.json();
   if (!data.downloadUrl) throw new Error("Resolver did not return a valid downloadUrl");
+
+  console.log("Resolved downloadUrl:", data.downloadUrl);
   return data.downloadUrl;
 }
 
@@ -106,8 +111,7 @@ async function processChunk(
   url: string,
   inputUrl: string,
   offset: number,
-  end: number,
-  attempt = 1
+  end: number
 ): Promise<{ offset: number; result: any; chunkSize: number }> {
   let resp = await fetch(url, { headers: { Range: `bytes=${offset}-${end}` } });
 
@@ -121,20 +125,14 @@ async function processChunk(
   }
 
   const buffer = await resp.arrayBuffer();
-  if (buffer.byteLength === 0) {
-    if (attempt < 3) {
-      console.warn(`Empty chunk at offset=${offset}, retrying...`);
-      return processChunk(env, url, inputUrl, offset, end, attempt + 1);
-    }
-    throw new Error(`Empty chunk received after ${attempt} attempts`);
-  }
+  console.log("Chunk byteLength:", buffer.byteLength);
 
-  const head = new TextDecoder().decode(buffer.slice(0, 64));
-  if (/<!DOCTYPE|<html|{"error/.test(head)) {
-    if (attempt < 3) {
-      console.warn(`Non-audio data detected at offset=${offset}, retrying...`);
-      return processChunk(env, url, inputUrl, offset, end, attempt + 1);
-    }
+  // Guard: detect non-audio response
+  const head = new Uint8Array(buffer.slice(0, 64));
+  console.log("Chunk head raw bytes:", Array.from(head));
+  console.log("Chunk head decoded:", new TextDecoder().decode(head));
+
+  if (buffer.byteLength === 0 || /<!DOCTYPE|<html|{"error/.test(new TextDecoder().decode(head))) {
     throw new Error(`Harvester returned non-audio data at offset=${offset}`);
   }
 
@@ -155,27 +153,26 @@ export default {
       if (!inputUrl) return json({ error: "Missing ?url" }, 400);
 
       const parallelOverride = parseInt(searchParams.get("parallel") || "");
-      const MAX_PARALLEL =
-        !isNaN(parallelOverride) && parallelOverride > 0
-          ? parallelOverride
-          : DEFAULT_PARALLEL;
+      const chunkOverride = parseInt(searchParams.get("chunk") || "");
 
       let url = await resolveUrl(inputUrl, env);
+      console.log("Resolved final media URL:", url);
 
-      // Probe file size
-      const probeResp = await fetch(url, { headers: { Range: "bytes=0-0" } });
-      if (!probeResp.ok) throw new Error(`Probe failed: ${probeResp.status}`);
-      const contentRange = probeResp.headers.get("Content-Range");
+      // probe file size
       let fileSize = 0;
-      if (contentRange) {
-        const parts = contentRange.split("/");
-        if (parts.length === 2) fileSize = parseInt(parts[1], 10);
-      }
+      const probeResp = await fetch(url, { headers: { Range: "bytes=0-0" } });
+      console.log(
+        "Probe status:", probeResp.status,
+        "Content-Range:", probeResp.headers.get("Content-Range"),
+        "Content-Type:", probeResp.headers.get("content-type")
+      );
 
-      // Dynamically adjust chunk size
-      let chunkSize = DEFAULT_CHUNK_SIZE;
-      if (fileSize > 40 * 1024 * 1024) {
-        chunkSize = 4 * 1024 * 1024; // use 4MB chunks for larger files
+      if (probeResp.ok) {
+        const contentRange = probeResp.headers.get("Content-Range");
+        if (contentRange) {
+          const parts = contentRange.split("/");
+          if (parts.length === 2) fileSize = parseInt(parts[1], 10);
+        }
       }
 
       const allChunks: { offset: number; result: any; chunkSize: number }[] = [];
@@ -183,12 +180,67 @@ export default {
 
       if (fileSize > 0 && fileSize <= SMALL_FILE_LIMIT) {
         const fullResp = await fetch(url);
+        const contentType = fullResp.headers.get("content-type") || "";
+        console.log("Full fetch content-type:", contentType);
         const buffer = await fullResp.arrayBuffer();
+        console.log("Full fetch byteLength:", buffer.byteLength);
+
+        const head = new Uint8Array(buffer.slice(0, 64));
+        console.log("Head raw bytes (small file):", Array.from(head));
+        console.log("Head decoded (small file):", new TextDecoder().decode(head));
+
+        if (!/audio|video/.test(contentType)) {
+          throw new Error(`Invalid media response (content-type=${contentType})`);
+        }
+
         const base64Audio = toBase64(buffer);
         const aiResp = await env.AI.run("@cf/openai/whisper-large-v3-turbo", { audio: base64Audio });
         allChunks.push({ offset: 0, result: aiResp, chunkSize: buffer.byteLength });
         offset = buffer.byteLength;
+      } else if (fileSize === 0) {
+        console.log("File size unknown → fetching full file as fallback");
+        const fullResp = await fetch(url);
+        const contentType = fullResp.headers.get("content-type") || "";
+        console.log("Full fetch content-type:", contentType);
+        const buffer = await fullResp.arrayBuffer();
+        console.log("Full fetch byteLength:", buffer.byteLength);
+
+        const head = new Uint8Array(buffer.slice(0, 64));
+        console.log("Head raw bytes (fallback):", Array.from(head));
+        console.log("Head decoded (fallback):", new TextDecoder().decode(head));
+
+        if (!/audio|video/.test(contentType)) {
+          throw new Error(`Invalid media response (content-type=${contentType})`);
+        }
+
+        const base64Audio = toBase64(buffer);
+        const aiResp = await env.AI.run("@cf/openai/whisper-large-v3-turbo", { audio: base64Audio });
+        allChunks.push({ offset: 0, result: aiResp, chunkSize: buffer.byteLength });
+        offset = buffer.byteLength;
+        fileSize = buffer.byteLength;
+      } else if (fileSize > 0 && fileSize <= MEDIUM_FILE_LIMIT) {
+        let chunkSize = DEFAULT_CHUNK_SIZE;
+        if (fileSize > 40 * 1024 * 1024) chunkSize = 4 * 1024 * 1024;
+        if (!isNaN(chunkOverride) && chunkOverride > 0) chunkSize = chunkOverride;
+        const MAX_PARALLEL =
+          !isNaN(parallelOverride) && parallelOverride > 0 ? parallelOverride : DEFAULT_PARALLEL;
+
+        while (offset < fileSize) {
+          const tasks = [];
+          for (let i = 0; i < MAX_PARALLEL && offset < fileSize; i++) {
+            const end = Math.min(offset + chunkSize - 1, fileSize - 1);
+            tasks.push(processChunk(env, url, inputUrl, offset, end));
+            offset += chunkSize;
+          }
+          const results = await Promise.all(tasks);
+          allChunks.push(...results);
+        }
       } else {
+        let chunkSize = SAFE_CHUNK_SIZE;
+        if (!isNaN(chunkOverride) && chunkOverride > 0) chunkSize = chunkOverride;
+        const MAX_PARALLEL =
+          !isNaN(parallelOverride) && parallelOverride > 0 ? parallelOverride : SAFE_PARALLEL;
+
         while (offset < fileSize) {
           const tasks = [];
           for (let i = 0; i < MAX_PARALLEL && offset < fileSize; i++) {
@@ -212,8 +264,8 @@ export default {
         bytesProcessed: offset,
         fileSize: fileSize || null,
         isComplete: fileSize ? offset >= fileSize : null,
-        parallelism: MAX_PARALLEL,
-        chunkSize,
+        parallelism: parallelOverride || (fileSize > MEDIUM_FILE_LIMIT ? SAFE_PARALLEL : DEFAULT_PARALLEL),
+        chunkSize: chunkOverride || (fileSize > MEDIUM_FILE_LIMIT ? SAFE_CHUNK_SIZE : DEFAULT_CHUNK_SIZE),
       };
 
       return json({ text: merged.text, segments: merged.segments, meta });
