@@ -7,3 +7,12 @@ binding = "AI"
 
 [vars]
 HARVEST_KEY = "e0c35da0-7999-45f9-ae2d-738e2f2af223"
+
+
+[[durable_objects.bindings]]
+name = "TRANSCRIBER_DO"
+class_name = "TranscriberDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["TranscriberDO"]

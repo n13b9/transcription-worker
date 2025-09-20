@@ -2,7 +2,6 @@ import fetch from "node-fetch";
 import dotenv from "dotenv";
 dotenv.config();
 
-
 // Config
 const WORKER_URL = process.env.WORKER_URL!;
 
@@ -40,8 +39,10 @@ function mergeResults(chunks: Array<{ offset: number; result: any }>) {
 
     // Calculate time offset in seconds
     const chunkDuration = result.transcription_info?.duration ?? 0;
+
+    const lastSegment = globalSegments[globalSegments.length - 1];
     const timeOffset =
-      (offset / result.chunkSize) * chunkDuration || globalSegments.at(-1)?.end || 0;
+      (offset / result.chunkSize) * chunkDuration || lastSegment?.end || 0;
 
     for (const s of segs) {
       globalSegments.push({
@@ -119,7 +120,7 @@ async function run() {
         throw new Error(`Worker failed: ${res.status} ${res.statusText} ${text}`);
       }
 
-      const json:any = await res.json();
+      const json: any = await res.json();
       allChunks.push({ offset, result: json.result });
 
       if (json.done) {
@@ -134,7 +135,6 @@ async function run() {
     console.log("\n✅ FINAL TRANSCRIPTION (merged):\n");
     console.log(merged.text);
 
-   
   } catch (err) {
     console.error("❌ Error:", err);
     process.exitCode = 1;
