@@ -1,4 +1,4 @@
-name = "transcription-worker"
+name = "transcription"
 main = "src/index.ts"
 compatibility_date = "2025-09-08"
 
